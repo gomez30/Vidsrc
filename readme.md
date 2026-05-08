@@ -78,6 +78,25 @@ Default server:
 http://127.0.0.1:5050
 ```
 
+## Deploy on Vercel
+
+This repo is now configured for Vercel with `vercel.json` using `api.py` as the Python entrypoint.
+
+### Quick deploy steps
+
+1. Push this `Vidsrc` folder to GitHub.
+2. In Vercel, click **New Project** and import that repo.
+3. If this repo is inside a larger monorepo, set **Root Directory** to `flix/Vidsrc`.
+4. Deploy (no special environment variables required for the current code).
+
+### Build/runtime notes
+
+- Framework preset can stay as auto-detected.
+- Vercel will install dependencies from `requirements.txt`.
+- All routes are mapped to `api.py`, so:
+  - `/` shows the docs UI page
+  - `/extract?...` works as API endpoint
+
 ## API Endpoint
 
 ### `GET /extract`
