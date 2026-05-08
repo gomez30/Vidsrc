@@ -99,6 +99,8 @@ This repo is now configured for Vercel with `vercel.json` using `api.py` as the 
 - If upstream starts blocking requests (Cloudflare/anti-bot), set:
   - `UPSTREAM_PROXY_URL` to a working HTTP(S) proxy
   - `VIDSRC_BASE_URL` if you need to target another upstream mirror/domain
+  - `VIDSRC_COOKIE` if you want to pass browser cookies (for example `cf_clearance=...; __cf_bm=...`)
+- The extractor now includes a `cloudscraper` fallback for requests that receive `403`.
 
 ## API Endpoint
 

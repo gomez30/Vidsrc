@@ -7,11 +7,28 @@ import os
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+try:
+    import cloudscraper
+except Exception:
+    cloudscraper = None
+
+
+class _CompatResponse:
+    def __init__(self, status_code, text, json_data=None):
+        self.status_code = status_code
+        self.text = text
+        self._json_data = json_data
+
+    def json(self):
+        if self._json_data is None:
+            raise ValueError("Response does not contain JSON data")
+        return self._json_data
 
 class VidsrcExtractor:
     def __init__(self):
         self.base_url = os.getenv("VIDSRC_BASE_URL", "https://vidsrc.cc").rstrip("/")
         proxy_url = os.getenv("UPSTREAM_PROXY_URL")
+        self.cookie_header = os.getenv("VIDSRC_COOKIE", "")
         self.browser_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -20,6 +37,8 @@ class VidsrcExtractor:
             "Pragma": "no-cache",
             "Upgrade-Insecure-Requests": "1",
         }
+        if self.cookie_header:
+            self.browser_headers["Cookie"] = self.cookie_header
         self.client = httpx.Client(
             headers={**self.browser_headers, "Referer": f"{self.base_url}/"},
             follow_redirects=True,
@@ -41,6 +60,11 @@ class VidsrcExtractor:
                     follow_redirects=True,
                     timeout=30.0,
                 )
+        self.scraper = None
+        if cloudscraper is not None:
+            self.scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "desktop": True}
+            )
         self.secret_prefix = "Cns#nGelOl"
         self.stream_cache = {}
         self.stream_cache_ttl = 300
@@ -55,6 +79,43 @@ class VidsrcExtractor:
             self.last_error = message
         print(self.last_error)
         return None
+
+    def _request_get(self, url, headers=None, params=None, follow_redirects=True):
+        req_headers = headers or {}
+        response = self.client.get(
+            url,
+            headers=req_headers,
+            params=params,
+            follow_redirects=follow_redirects,
+        )
+
+        # Fallback for Cloudflare-protected pages when plain httpx gets blocked.
+        if response.status_code != 403 or self.scraper is None:
+            return response
+
+        try:
+            merged_headers = {**self.browser_headers, **req_headers}
+            scraper_res = self.scraper.get(
+                url,
+                headers=merged_headers,
+                params=params,
+                allow_redirects=follow_redirects,
+                timeout=30,
+            )
+            json_data = None
+            content_type = scraper_res.headers.get("content-type", "")
+            if "application/json" in content_type:
+                try:
+                    json_data = scraper_res.json()
+                except Exception:
+                    json_data = None
+            return _CompatResponse(
+                status_code=scraper_res.status_code,
+                text=scraper_res.text,
+                json_data=json_data,
+            )
+        except Exception:
+            return response
 
     def _extract_streameee_token(self, html):
         xy_ws_match = re.search(r'window\._xy_ws\s*=\s*"([^"]+)"', html)
@@ -103,7 +164,7 @@ class VidsrcExtractor:
 
         try:
             for headers in request_profiles:
-                response = self.client.get(url, headers=headers, follow_redirects=True)
+                response = self._request_get(url, headers=headers, follow_redirects=True)
                 token = self._extract_streameee_token(response.text)
                 if token:
                     self.token_cache[url] = {
@@ -113,7 +174,7 @@ class VidsrcExtractor:
                     return token
 
             time.sleep(0.15)
-            response = self.client.get(url, headers=request_profiles[-1], follow_redirects=True)
+            response = self._request_get(url, headers=request_profiles[-1], follow_redirects=True)
             token = self._extract_streameee_token(response.text)
             if token:
                 self.token_cache[url] = {
@@ -163,7 +224,7 @@ class VidsrcExtractor:
         else:
             url = f"{self.base_url}/v2/embed/movie/{id}"
 
-        res = self.client.get(url, headers={
+        res = self._request_get(url, headers={
             **self.browser_headers,
             "Referer": f"{self.base_url}/",
         })
@@ -216,11 +277,11 @@ class VidsrcExtractor:
             params["type"] = "movie"
 
         server_url = f"{self.base_url}/api/{movie_id}/servers"
-        server_res = self.client.get(server_url, params=params)
+        server_res = self._request_get(server_url, params=params)
         
         if server_res.status_code == 404:
             server_url = f"{self.base_url}/api/episodes/{movie_id}/servers"
-            server_res = self.client.get(server_url, params=params)
+            server_res = self._request_get(server_url, params=params)
         
         try:
             servers = server_res.json()
@@ -235,7 +296,7 @@ class VidsrcExtractor:
         except (IndexError, KeyError, TypeError) as e:
             return self._fail(f"Failed to extract hash from server data: {e}")
 
-        source_res = self.client.get(f"{self.base_url}/api/source/{hash}")
+        source_res = self._request_get(f"{self.base_url}/api/source/{hash}")
         try:
             source_json = source_res.json()
             if not source_json.get("success") or not source_json.get("data"):
@@ -247,7 +308,7 @@ class VidsrcExtractor:
         import urllib.parse
         iframe_url = urllib.parse.unquote(iframe_url)
         iframe_url = urllib.parse.urljoin(self.base_url, iframe_url)
-        lucky_res = self.client.get(iframe_url, follow_redirects=True, headers={
+        lucky_res = self._request_get(iframe_url, follow_redirects=True, headers={
             **self.browser_headers,
             "Referer": f"{self.base_url}/",
         })
@@ -258,7 +319,7 @@ class VidsrcExtractor:
         next_url = next_url_match.group(1).replace(r'\/', '/').replace(r'\u0026', '&')
         next_url = urllib.parse.urljoin(iframe_url, next_url)
         # 6. Fetch final embed page
-        embed_res = self.client.get(next_url, headers={
+        embed_res = self._request_get(next_url, headers={
             **self.browser_headers,
             "Referer": iframe_url,
         })
@@ -276,7 +337,7 @@ class VidsrcExtractor:
         try:
             if "rapid-cloud" in next_url:
                 sources_url = f"{base_parts}/{embed_id}/v2/e-1/getSources?id={file_id}"
-                final_res = self.client.get(sources_url, headers={
+                final_res = self._request_get(sources_url, headers={
                     "X-Requested-With": "XMLHttpRequest",
                     "Referer": next_url
                 })
@@ -302,7 +363,7 @@ class VidsrcExtractor:
 
                 sources_url = f"{base_parts}/{embed_id}/v3/e-1/getSources?id={file_id}&_k={k_token}"
                 
-                final_res = self.client.get(sources_url, headers={
+                final_res = self._request_get(sources_url, headers={
                     "X-Requested-With": "XMLHttpRequest",
                     "Referer": next_url
                 })
