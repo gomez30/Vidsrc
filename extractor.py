@@ -276,20 +276,38 @@ class VidsrcExtractor:
         else:
             params["type"] = "movie"
 
-        server_url = f"{self.base_url}/api/{movie_id}/servers"
-        server_res = self._request_get(server_url, params=params)
-        
-        if server_res.status_code == 404:
-            server_url = f"{self.base_url}/api/episodes/{movie_id}/servers"
+        server_urls = [
+            f"{self.base_url}/api/{movie_id}/servers",
+            f"{self.base_url}/api/episodes/{movie_id}/servers",
+        ]
+        servers = None
+        server_res = None
+        last_error_message = None
+
+        for server_url in server_urls:
             server_res = self._request_get(server_url, params=params)
-        
-        try:
-            servers = server_res.json()
-        except Exception as e:
-            return self._fail(f"Failed to parse servers JSON: {e}", upstream_status=server_res.status_code)
-        
-        if not servers.get("success") or not servers.get("data"):
-            return self._fail("Servers endpoint returned empty or failed response", upstream_status=server_res.status_code)
+            try:
+                candidate = server_res.json()
+            except Exception as e:
+                last_error_message = f"Failed to parse servers JSON: {e}"
+                continue
+
+            if candidate.get("success") and candidate.get("data"):
+                servers = candidate
+                break
+
+            # Keep context from the latest failed candidate while trying fallback route.
+            last_error_message = "Servers endpoint returned empty or failed response"
+
+            # If first endpoint rejects request params (commonly 400), try alternate route.
+            if server_res.status_code in (400, 404):
+                continue
+
+        if servers is None:
+            return self._fail(
+                last_error_message or "Servers endpoint returned empty or failed response",
+                upstream_status=(server_res.status_code if server_res is not None else None),
+            )
             
         try:
             hash = servers["data"][0]["hash"]
