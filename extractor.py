@@ -3,13 +3,15 @@ import re
 import base64
 import hashlib
 import time
+import os
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 class VidsrcExtractor:
     def __init__(self):
-        self.base_url = "https://vidsrc.cc"
+        self.base_url = os.getenv("VIDSRC_BASE_URL", "https://vidsrc.cc").rstrip("/")
+        proxy_url = os.getenv("UPSTREAM_PROXY_URL")
         self.browser_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -18,15 +20,41 @@ class VidsrcExtractor:
             "Pragma": "no-cache",
             "Upgrade-Insecure-Requests": "1",
         }
-        self.client = httpx.Client(headers={
-            **self.browser_headers,
-            "Referer": "https://vidsrc.cc/"
-        })
+        self.client = httpx.Client(
+            headers={**self.browser_headers, "Referer": f"{self.base_url}/"},
+            follow_redirects=True,
+            timeout=30.0,
+        )
+        if proxy_url:
+            # Support both old and new httpx proxy keyword styles.
+            try:
+                self.client = httpx.Client(
+                    headers={**self.browser_headers, "Referer": f"{self.base_url}/"},
+                    proxies=proxy_url,
+                    follow_redirects=True,
+                    timeout=30.0,
+                )
+            except TypeError:
+                self.client = httpx.Client(
+                    headers={**self.browser_headers, "Referer": f"{self.base_url}/"},
+                    proxy=proxy_url,
+                    follow_redirects=True,
+                    timeout=30.0,
+                )
         self.secret_prefix = "Cns#nGelOl"
         self.stream_cache = {}
         self.stream_cache_ttl = 300
         self.token_cache = {}
         self.token_cache_ttl = 900
+        self.last_error = None
+
+    def _fail(self, message, upstream_status=None):
+        if upstream_status is not None:
+            self.last_error = f"{message} (upstream_status={upstream_status})"
+        else:
+            self.last_error = message
+        print(self.last_error)
+        return None
 
     def _extract_streameee_token(self, html):
         xy_ws_match = re.search(r'window\._xy_ws\s*=\s*"([^"]+)"', html)
@@ -122,6 +150,7 @@ class VidsrcExtractor:
         return vrf
 
     def get_stream(self, id, is_tv=False, season=None, episode=None, is_anime=False, sub_or_dub="sub"):
+        self.last_error = None
         cache_key = (id, is_tv, season, episode, is_anime, sub_or_dub)
         cached = self.stream_cache.get(cache_key)
         if cached and cached["expires_at"] > time.time():
@@ -136,25 +165,17 @@ class VidsrcExtractor:
 
         res = self.client.get(url, headers={
             **self.browser_headers,
-            "Referer": "https://vidsrc.cc/",
+            "Referer": f"{self.base_url}/",
         })
         if res.status_code != 200:
-            print(f"Failed to fetch embed page: {url}. Status: {res.status_code}")
-            return
+            return self._fail("Failed to fetch embed page (possible Cloudflare block or invalid ID)", upstream_status=res.status_code)
             
         soup = BeautifulSoup(res.text, 'html.parser')
         
         try:
             script_tag = soup.find('script', string=re.compile("var v ="))
             if not script_tag:
-                print(f"Could not find script with 'var v =' on page: {url}")
-                print("All script tags found:")
-                for s in soup.find_all('script'):
-                    if s.string:
-                        print(f"Script (string): {s.string[:200]}...")
-                    else:
-                        print(f"Script (src): {s.get('src')}")
-                return
+                return self._fail("Could not find expected player script variables (upstream page likely changed)")
             
             script_text = script_tag.text
             
@@ -171,11 +192,9 @@ class VidsrcExtractor:
             imdb_id = get_var("imdbId", script_text) or ""
             
             if not all([v, user_id, movie_id]):
-                print(f"Failed to extract some vars: v={v}, user_id={user_id}, movie_id={movie_id}")
-                return
+                return self._fail("Failed to extract required vars from embed page (v/userId/movieId)")
         except Exception as e:
-            print(f"Error parsing script variables: {e}")
-            return
+            return self._fail(f"Error parsing embed page variables: {e}")
 
         vrf = self.generate_vrf(movie_id, user_id)
 
@@ -206,50 +225,38 @@ class VidsrcExtractor:
         try:
             servers = server_res.json()
         except Exception as e:
-            print(f"Failed to parse JSON for servers. Status: {server_res.status_code}, Error: {e}")
-            return None
-            
-        print("SERVERS Response:", servers)
+            return self._fail(f"Failed to parse servers JSON: {e}", upstream_status=server_res.status_code)
         
         if not servers.get("success") or not servers.get("data"):
-            print(f"Server API returned failure or empty data: {servers}")
-            return None
+            return self._fail("Servers endpoint returned empty or failed response", upstream_status=server_res.status_code)
             
         try:
             hash = servers["data"][0]["hash"]
         except (IndexError, KeyError, TypeError) as e:
-            print(f"Failed to extract hash from server data: {e}")
-            return None
+            return self._fail(f"Failed to extract hash from server data: {e}")
 
         source_res = self.client.get(f"{self.base_url}/api/source/{hash}")
         try:
             source_json = source_res.json()
             if not source_json.get("success") or not source_json.get("data"):
-                print(f"Source API returned failure: {source_json}")
-                return None
+                return self._fail("Source endpoint returned empty or failed response", upstream_status=source_res.status_code)
             iframe_url = source_json["data"]["source"]
         except Exception as e:
-            print(f"Failed to parse source iframe: {e}")
-            return None
+            return self._fail(f"Failed to parse source iframe response: {e}", upstream_status=source_res.status_code)
 
         import urllib.parse
         iframe_url = urllib.parse.unquote(iframe_url)
         iframe_url = urllib.parse.urljoin(self.base_url, iframe_url)
-        print("Iframe URL:", iframe_url)
-
         lucky_res = self.client.get(iframe_url, follow_redirects=True, headers={
             **self.browser_headers,
             "Referer": f"{self.base_url}/",
         })
         next_url_match = re.search(r'var source = "(.*?)"', lucky_res.text)
         if not next_url_match:
-            print(f"Failed to find source variable on page: {iframe_url}")
-            return None
+            return self._fail("Failed to resolve provider source URL from iframe page")
             
         next_url = next_url_match.group(1).replace(r'\/', '/').replace(r'\u0026', '&')
         next_url = urllib.parse.urljoin(iframe_url, next_url)
-        print("Next URL:", next_url)
-
         # 6. Fetch final embed page
         embed_res = self.client.get(next_url, headers={
             **self.browser_headers,
@@ -257,15 +264,13 @@ class VidsrcExtractor:
         })
         file_id_match = re.search(r'/e-1/(.*?)\?', next_url)
         if not file_id_match:
-            print(f"Failed to extract file_id from: {next_url}")
-            return None
+            return self._fail("Failed to extract provider file_id from resolved URL")
         file_id = file_id_match.group(1)
             
         base_parts = next_url.split('/embed-')[0]
         embed_id_match = re.search(r'/(embed-\d+)/', next_url)
         if not embed_id_match:
-            print(f"Failed to extract embed_id from: {next_url}")
-            return None
+            return self._fail("Failed to extract provider embed_id from resolved URL")
         embed_id = embed_id_match.group(1)
         
         try:
@@ -293,9 +298,7 @@ class VidsrcExtractor:
                     }
 
                 if not k_token:
-                    print("Embed page snippet:", embed_res.text[:1200])
-                    print(f"Failed to find _k token on: {next_url}")
-                    return None
+                    return self._fail("Failed to find _k token on provider page (provider anti-bot may have changed)")
 
                 sources_url = f"{base_parts}/{embed_id}/v3/e-1/getSources?id={file_id}&_k={k_token}"
                 
@@ -310,8 +313,7 @@ class VidsrcExtractor:
                 }
                 return result
         except Exception as e:
-            print(f"Final extraction failed: {e}")
-            return None
+            return self._fail(f"Final extraction failed: {e}")
 
 if __name__ == "__main__":
     extractor = VidsrcExtractor()

@@ -87,7 +87,7 @@ This repo is now configured for Vercel with `vercel.json` using `api.py` as the 
 1. Push this `Vidsrc` folder to GitHub.
 2. In Vercel, click **New Project** and import that repo.
 3. If this repo is inside a larger monorepo, set **Root Directory** to `flix/Vidsrc`.
-4. Deploy (no special environment variables required for the current code).
+4. Deploy.
 
 ### Build/runtime notes
 
@@ -96,6 +96,9 @@ This repo is now configured for Vercel with `vercel.json` using `api.py` as the 
 - All routes are mapped to `api.py`, so:
   - `/` shows the docs UI page
   - `/extract?...` works as API endpoint
+- If upstream starts blocking requests (Cloudflare/anti-bot), set:
+  - `UPSTREAM_PROXY_URL` to a working HTTP(S) proxy
+  - `VIDSRC_BASE_URL` if you need to target another upstream mirror/domain
 
 ## API Endpoint
 

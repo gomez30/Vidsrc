@@ -432,7 +432,10 @@ def extract(
         )
         
         if not result:
-            raise HTTPException(status_code=404, detail="Could not extract sources")
+            raise HTTPException(
+                status_code=502,
+                detail=extractor.last_error or "Could not extract sources",
+            )
             
         return result
     except FastAPIHTTPException:
