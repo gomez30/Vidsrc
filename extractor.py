@@ -259,6 +259,7 @@ class VidsrcExtractor:
 
         vrf = self.generate_vrf(movie_id, user_id)
 
+        requested_id = str(id)
         params = {
             "id": movie_id,
             "type": "tv" if is_tv else "movie",
@@ -276,36 +277,68 @@ class VidsrcExtractor:
         else:
             params["type"] = "movie"
 
+        fallback_params_movie_id = dict(params)
+        fallback_params_movie_id.pop("id", None)
+        fallback_params_movie_id["movieId"] = movie_id
+
+        fallback_params_requested_id = dict(params)
+        fallback_params_requested_id["id"] = requested_id
+
+        fallback_params_requested_movie_id = dict(fallback_params_requested_id)
+        fallback_params_requested_movie_id.pop("id", None)
+        fallback_params_requested_movie_id["movieId"] = requested_id
+
+        fallback_param_sets = [
+            params,
+            fallback_params_movie_id,
+            fallback_params_requested_id,
+            fallback_params_requested_movie_id,
+        ]
+
         server_urls = [
+            f"{self.base_url}/api/{requested_id}/servers",
             f"{self.base_url}/api/{movie_id}/servers",
+            f"{self.base_url}/api/{params['type']}/{requested_id}/servers",
+            f"{self.base_url}/api/{params['type']}/{movie_id}/servers",
+            f"{self.base_url}/api/episodes/{requested_id}/servers",
             f"{self.base_url}/api/episodes/{movie_id}/servers",
         ]
         servers = None
         server_res = None
         last_error_message = None
+        attempt_summaries = []
 
         for server_url in server_urls:
-            server_res = self._request_get(server_url, params=params)
-            try:
-                candidate = server_res.json()
-            except Exception as e:
-                last_error_message = f"Failed to parse servers JSON: {e}"
-                continue
+            for param_set in fallback_param_sets:
+                server_res = self._request_get(server_url, params=param_set)
+                attempt_summaries.append(
+                    f"{server_res.status_code} {server_url} params={','.join(sorted(param_set.keys()))}"
+                )
+                try:
+                    candidate = server_res.json()
+                except Exception as e:
+                    last_error_message = f"Failed to parse servers JSON: {e}"
+                    continue
 
-            if candidate.get("success") and candidate.get("data"):
-                servers = candidate
+                if candidate.get("success") and candidate.get("data"):
+                    servers = candidate
+                    break
+
+                # Keep context from the latest failed candidate while trying fallback route.
+                last_error_message = "Servers endpoint returned empty or failed response"
+
+                # If endpoint rejects request params (commonly 400/404), try alternates.
+                if server_res.status_code in (400, 404):
+                    continue
+            if servers is not None:
                 break
-
-            # Keep context from the latest failed candidate while trying fallback route.
-            last_error_message = "Servers endpoint returned empty or failed response"
-
-            # If first endpoint rejects request params (commonly 400), try alternate route.
-            if server_res.status_code in (400, 404):
-                continue
 
         if servers is None:
             return self._fail(
-                last_error_message or "Servers endpoint returned empty or failed response",
+                (
+                    (last_error_message or "Servers endpoint returned empty or failed response")
+                    + f" | attempts: {' ; '.join(attempt_summaries[:6])}"
+                ),
                 upstream_status=(server_res.status_code if server_res is not None else None),
             )
             
